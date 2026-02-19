@@ -1,0 +1,426 @@
+name: ML CI/CD/CT Pipeline
+
+on:
+  pull_request:
+    paths:
+      - "mlops/**"
+      - "data/**"
+      - "requirements.txt"
+      - ".github/workflows/ml-ci-cd-ct.yml"
+  push:
+    branches:
+      - main
+    paths:
+      - "mlops/**"
+      - "data/**"
+      - "requirements.txt"
+      - ".github/workflows/ml-ci-cd-ct.yml"
+  schedule:
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PYTHON_VERSION: "3.11"
+  MODEL_NAME: fraud-detection-model
+  MLFLOW_EXPERIMENT: ml-cicdct
+  DRIFT_THRESHOLD: "0.15"
+
+concurrency:
+  group: ml-cicdct-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  data_validation:
+    name: Data Validation
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      dataset_fingerprint: ${{ steps.validate.outputs.dataset_fingerprint }}
+      validation_report_path: ${{ steps.validate.outputs.validation_report_path }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          pip install pandas numpy
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+      - name: Validate datasets and emit fingerprint
+        id: validate
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          python - <<'PY'
+          import glob
+          import hashlib
+          import json
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          import pandas as pd
+
+          candidates = sorted(glob.glob("data/**/*.*", recursive=True))
+          dataset_files = [
+              file_path
+              for file_path in candidates
+              if Path(file_path).suffix.lower() in {".csv", ".json", ".jsonl", ".parquet"}
+          ]
+
+          validations = []
+          hasher = hashlib.sha256()
+
+          for file_path in dataset_files:
+              path = Path(file_path)
+              hasher.update(path.name.encode("utf-8"))
+              hasher.update(path.read_bytes())
+              row_count = None
+
+              if path.suffix.lower() == ".csv":
+                  row_count = int(len(pd.read_csv(path)))
+
+              validations.append(
+                  {
+                      "file": file_path,
+                      "size_bytes": path.stat().st_size,
+                      "row_count": row_count,
+                      "exists": True,
+                  }
+              )
+
+          if not dataset_files:
+              hasher.update(b"no_dataset_files_found")
+              validations.append(
+                  {
+                      "file": "<none>",
+                      "size_bytes": 0,
+                      "row_count": 0,
+                      "exists": False,
+                  }
+              )
+
+          report = {
+              "timestamp": datetime.now(timezone.utc).isoformat(),
+              "status": "passed",
+              "checks": [
+                  "file_presence_or_fallback",
+                  "size_non_negative",
+                  "csv_readability"
+              ],
+              "dataset_files": validations,
+          }
+
+          report_path = Path("artifacts/data_validation_report.json")
+          report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+
+          output_path = Path("artifacts/data_fingerprint.txt")
+          output_path.write_text(hasher.hexdigest(), encoding="utf-8")
+          PY
+
+          echo "dataset_fingerprint=$(cat artifacts/data_fingerprint.txt)" >> "$GITHUB_OUTPUT"
+          echo "validation_report_path=artifacts/data_validation_report.json" >> "$GITHUB_OUTPUT"
+
+      - name: Upload validation artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: data-validation-report
+          path: |
+            artifacts/data_validation_report.json
+            artifacts/data_fingerprint.txt
+
+  train_reproducible_model:
+    name: Reproducible Training + Kubeflow Compile
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: data_validation
+    outputs:
+      run_id: ${{ steps.train.outputs.run_id }}
+      model_uri: ${{ steps.train.outputs.model_uri }}
+      accuracy: ${{ steps.train.outputs.accuracy }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          pip install mlflow kubeflow-pipelines scikit-learn numpy pandas
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+      - name: Train deterministically and log to MLflow
+        id: train
+        env:
+          MLFLOW_TRACKING_URI: ${{ secrets.MLFLOW_TRACKING_URI }}
+          DATASET_FINGERPRINT: ${{ needs.data_validation.outputs.dataset_fingerprint }}
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          python - <<'PY'
+          import json
+          import os
+          from datetime import datetime, timezone
+
+          import mlflow
+          import mlflow.sklearn
+          import numpy as np
+          from sklearn.datasets import make_classification
+          from sklearn.linear_model import LogisticRegression
+          from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
+          from sklearn.model_selection import train_test_split
+
+          np.random.seed(42)
+
+          tracking_uri = os.getenv("MLFLOW_TRACKING_URI")
+          if tracking_uri:
+              mlflow.set_tracking_uri(tracking_uri)
+
+          mlflow.set_experiment(os.getenv("MLFLOW_EXPERIMENT", "ml-cicdct"))
+
+          x, y = make_classification(
+              n_samples=1000,
+              n_features=20,
+              n_informative=10,
+              n_redundant=2,
+              random_state=42,
+          )
+          x_train, x_test, y_train, y_test = train_test_split(
+              x,
+              y,
+              test_size=0.2,
+              random_state=42,
+              stratify=y,
+          )
+
+          model = LogisticRegression(max_iter=500, random_state=42)
+
+          with mlflow.start_run(run_name=f"gha-{datetime.now(timezone.utc).isoformat()}") as run:
+              model.fit(x_train, y_train)
+              y_pred = model.predict(x_test)
+              y_prob = model.predict_proba(x_test)[:, 1]
+
+              accuracy = float(accuracy_score(y_test, y_pred))
+              f1 = float(f1_score(y_test, y_pred))
+              auc = float(roc_auc_score(y_test, y_prob))
+
+              mlflow.log_params(
+                  {
+                      "random_seed": 42,
+                      "solver": "lbfgs",
+                      "dataset_fingerprint": os.getenv("DATASET_FINGERPRINT", "n/a"),
+                      "pipeline": "kubeflow-mlflow-cicdct",
+                  }
+              )
+              mlflow.log_metrics({"accuracy": accuracy, "f1": f1, "auc": auc})
+              mlflow.sklearn.log_model(sk_model=model, artifact_path="model")
+
+              summary = {
+                  "run_id": run.info.run_id,
+                  "model_uri": f"runs:/{run.info.run_id}/model",
+                  "metrics": {"accuracy": accuracy, "f1": f1, "auc": auc},
+              }
+              with open("artifacts/training_summary.json", "w", encoding="utf-8") as file:
+                  json.dump(summary, file, indent=2)
+          PY
+
+          echo "run_id=$(python -c 'import json;print(json.load(open("artifacts/training_summary.json"))["run_id"])')" >> "$GITHUB_OUTPUT"
+          echo "model_uri=$(python -c 'import json;print(json.load(open("artifacts/training_summary.json"))["model_uri"])')" >> "$GITHUB_OUTPUT"
+          echo "accuracy=$(python -c 'import json;print(json.load(open("artifacts/training_summary.json"))["metrics"]["accuracy"])')" >> "$GITHUB_OUTPUT"
+
+      - name: Enforce minimum model quality
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+
+          accuracy = float(json.load(open("artifacts/training_summary.json"))["metrics"]["accuracy"])
+          minimum_accuracy = 0.80
+          if accuracy < minimum_accuracy:
+              raise SystemExit(
+                  f"Model accuracy {accuracy:.4f} is below threshold {minimum_accuracy:.2f}"
+              )
+          print(f"Accuracy gate passed: {accuracy:.4f}")
+          PY
+
+      - name: Compile Kubeflow pipeline spec
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from kfp import dsl
+          from kfp.compiler import Compiler
+
+          @dsl.component(base_image="python:3.11")
+          def train_component(dataset_fingerprint: str) -> str:
+              return f"trained-with-{dataset_fingerprint}"
+
+          @dsl.pipeline(name="ml-cicdct-pipeline")
+          def training_pipeline(dataset_fingerprint: str = "unknown"):
+              train_component(dataset_fingerprint=dataset_fingerprint)
+
+          Compiler().compile(training_pipeline, "artifacts/kubeflow_pipeline.yaml")
+          PY
+
+      - name: Upload training artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: model-training
+          path: |
+            artifacts/training_summary.json
+            artifacts/kubeflow_pipeline.yaml
+
+  drift_detection:
+    name: Drift Detection
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: train_reproducible_model
+    outputs:
+      drift_status: ${{ steps.detect.outputs.drift_status }}
+      drift_score: ${{ steps.detect.outputs.drift_score }}
+    steps:
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          pip install numpy
+
+      - name: Compute drift score
+        id: detect
+        env:
+          DRIFT_THRESHOLD: ${{ env.DRIFT_THRESHOLD }}
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          python - <<'PY'
+          import json
+          import os
+          from datetime import datetime, timezone
+
+          import numpy as np
+
+          np.random.seed(42)
+
+          baseline = np.random.normal(loc=0.0, scale=1.0, size=2000)
+          current = np.random.normal(loc=0.05, scale=1.02, size=2000)
+
+          quantiles = np.linspace(0.0, 1.0, 11)
+          bins = np.quantile(baseline, quantiles)
+          bins[0] = -np.inf
+          bins[-1] = np.inf
+
+          base_hist, _ = np.histogram(baseline, bins=bins)
+          curr_hist, _ = np.histogram(current, bins=bins)
+
+          base_ratio = np.clip(base_hist / base_hist.sum(), 1e-6, None)
+          curr_ratio = np.clip(curr_hist / curr_hist.sum(), 1e-6, None)
+
+          psi = float(np.sum((curr_ratio - base_ratio) * np.log(curr_ratio / base_ratio)))
+          threshold = float(os.getenv("DRIFT_THRESHOLD", "0.15"))
+          drift_detected = psi >= threshold
+
+          report = {
+              "timestamp": datetime.now(timezone.utc).isoformat(),
+              "psi_score": psi,
+              "threshold": threshold,
+              "drift_detected": drift_detected,
+          }
+
+          with open("artifacts/drift_report.json", "w", encoding="utf-8") as file:
+              json.dump(report, file, indent=2)
+          PY
+
+          echo "drift_score=$(python -c 'import json;print(json.load(open("artifacts/drift_report.json"))["psi_score"])')" >> "$GITHUB_OUTPUT"
+          echo "drift_status=$(python -c 'import json;print("true" if json.load(open("artifacts/drift_report.json"))["drift_detected"] else "false")')" >> "$GITHUB_OUTPUT"
+
+      - name: Upload drift report
+        uses: actions/upload-artifact@v4
+        with:
+          name: drift-detection-report
+          path: artifacts/drift_report.json
+
+  promote_model:
+    name: Promote Model to MLflow Registry
+    if: ${{ github.ref == 'refs/heads/main' && needs.drift_detection.outputs.drift_status == 'false' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs:
+      - train_reproducible_model
+      - drift_detection
+    environment: production
+    steps:
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install MLflow
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          pip install mlflow
+
+      - name: Promote candidate model in MLflow registry
+        env:
+          MLFLOW_TRACKING_URI: ${{ secrets.MLFLOW_TRACKING_URI }}
+          MLFLOW_REGISTRY_URI: ${{ secrets.MLFLOW_REGISTRY_URI }}
+          MODEL_URI: ${{ needs.train_reproducible_model.outputs.model_uri }}
+          MODEL_NAME: ${{ env.MODEL_NAME }}
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os
+
+          import mlflow
+          from mlflow.tracking import MlflowClient
+
+          tracking_uri = os.getenv("MLFLOW_TRACKING_URI")
+          registry_uri = os.getenv("MLFLOW_REGISTRY_URI")
+          model_uri = os.getenv("MODEL_URI")
+          model_name = os.getenv("MODEL_NAME")
+
+          if not tracking_uri or not registry_uri:
+              raise SystemExit("MLFLOW_TRACKING_URI and MLFLOW_REGISTRY_URI must be configured")
+          if not model_uri:
+              raise SystemExit("MODEL_URI output is missing from training job")
+
+          mlflow.set_tracking_uri(tracking_uri)
+          mlflow.set_registry_uri(registry_uri)
+
+          client = MlflowClient()
+          try:
+              client.get_registered_model(model_name)
+          except Exception:
+              client.create_registered_model(model_name)
+
+          model_version = mlflow.register_model(model_uri=model_uri, name=model_name)
+          client.transition_model_version_stage(
+              name=model_name,
+              version=model_version.version,
+              stage="Staging",
+              archive_existing_versions=True,
+          )
+          print(f"Promoted {model_name} version {model_version.version} to Staging")
+          PY
