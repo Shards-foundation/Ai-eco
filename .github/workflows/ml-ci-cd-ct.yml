@@ -62,13 +62,12 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p artifacts
-          python - <<'PY'
+          cat <<'PY' > validate.py
           import glob
           import hashlib
           import json
           from datetime import datetime, timezone
           from pathlib import Path
-
           import pandas as pd
 
           candidates = sorted(glob.glob("data/**/*.*", recursive=True))
@@ -127,7 +126,7 @@ jobs:
           output_path = Path("artifacts/data_fingerprint.txt")
           output_path.write_text(hasher.hexdigest(), encoding="utf-8")
           PY
-
+          python validate.py
           echo "dataset_fingerprint=$(cat artifacts/data_fingerprint.txt)" >> "$GITHUB_OUTPUT"
           echo "validation_report_path=artifacts/data_validation_report.json" >> "$GITHUB_OUTPUT"
 
@@ -173,11 +172,10 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p artifacts
-          python - <<'PY'
+          cat <<'PY' > train.py
           import json
           import os
           from datetime import datetime, timezone
-
           import mlflow
           import mlflow.sklearn
           import numpy as np
@@ -187,7 +185,6 @@ jobs:
           from sklearn.model_selection import train_test_split
 
           np.random.seed(42)
-
           tracking_uri = os.getenv("MLFLOW_TRACKING_URI")
           if tracking_uri:
               mlflow.set_tracking_uri(tracking_uri)
@@ -239,7 +236,7 @@ jobs:
               with open("artifacts/training_summary.json", "w", encoding="utf-8") as file:
                   json.dump(summary, file, indent=2)
           PY
-
+          python train.py
           echo "run_id=$(python -c 'import json;print(json.load(open("artifacts/training_summary.json"))["run_id"])')" >> "$GITHUB_OUTPUT"
           echo "model_uri=$(python -c 'import json;print(json.load(open("artifacts/training_summary.json"))["model_uri"])')" >> "$GITHUB_OUTPUT"
           echo "accuracy=$(python -c 'import json;print(json.load(open("artifacts/training_summary.json"))["metrics"]["accuracy"])')" >> "$GITHUB_OUTPUT"
@@ -247,9 +244,8 @@ jobs:
       - name: Enforce minimum model quality
         run: |
           set -euo pipefail
-          python - <<'PY'
+          cat <<'PY' > quality.py
           import json
-
           accuracy = float(json.load(open("artifacts/training_summary.json"))["metrics"]["accuracy"])
           minimum_accuracy = 0.80
           if accuracy < minimum_accuracy:
@@ -258,11 +254,12 @@ jobs:
               )
           print(f"Accuracy gate passed: {accuracy:.4f}")
           PY
+          python quality.py
 
       - name: Compile Kubeflow pipeline spec
         run: |
           set -euo pipefail
-          python - <<'PY'
+          cat <<'PY' > compile.py
           from kfp import dsl
           from kfp.compiler import Compiler
 
@@ -276,6 +273,7 @@ jobs:
 
           Compiler().compile(training_pipeline, "artifacts/kubeflow_pipeline.yaml")
           PY
+          python compile.py
 
       - name: Upload training artifacts
         uses: actions/upload-artifact@v4
@@ -313,15 +311,13 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p artifacts
-          python - <<'PY'
+          cat <<'PY' > drift.py
           import json
           import os
           from datetime import datetime, timezone
-
           import numpy as np
 
           np.random.seed(42)
-
           baseline = np.random.normal(loc=0.0, scale=1.0, size=2000)
           current = np.random.normal(loc=0.05, scale=1.02, size=2000)
 
@@ -350,7 +346,7 @@ jobs:
           with open("artifacts/drift_report.json", "w", encoding="utf-8") as file:
               json.dump(report, file, indent=2)
           PY
-
+          python drift.py
           echo "drift_score=$(python -c 'import json;print(json.load(open("artifacts/drift_report.json"))["psi_score"])')" >> "$GITHUB_OUTPUT"
           echo "drift_status=$(python -c 'import json;print("true" if json.load(open("artifacts/drift_report.json"))["drift_detected"] else "false")')" >> "$GITHUB_OUTPUT"
 
@@ -390,9 +386,8 @@ jobs:
           MODEL_NAME: ${{ env.MODEL_NAME }}
         run: |
           set -euo pipefail
-          python - <<'PY'
+          cat <<'PY' > promote.py
           import os
-
           import mlflow
           from mlflow.tracking import MlflowClient
 
@@ -424,3 +419,4 @@ jobs:
           )
           print(f"Promoted {model_name} version {model_version.version} to Staging")
           PY
+          python promote.py
