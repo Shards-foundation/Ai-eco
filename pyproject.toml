@@ -2,7 +2,8 @@
 name = "enterprise-ai-platform"
 version = "1.0.0"
 description = "Enterprise AI Orchestration"
-authors = ["AI Strategist <architect@shards.inc>"]
+authors = ["Shards Inc Ltd <architect@shards.inc>"]
+license = "MIT"
 
 [tool.poetry.dependencies]
 python = "^3.11"
