@@ -2,10 +2,10 @@ from pydantic import BaseModel
 from typing import List, Optional
 
 class QueryRequest(BaseModel):
-    prompt: string
-    context_id: Optional[string] = None
+    prompt: str
+    context_id: Optional[str] = None
 
 class QueryResponse(BaseModel):
-    id: string
-    answer: string
-    sources: List[string]
+    id: str
+    answer: str
+    sources: List[str]
