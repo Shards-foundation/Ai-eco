@@ -54,8 +54,7 @@ jobs:
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip
-          pip install pandas numpy
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          pip install 'numpy<2' 'pandas<3'
 
       - name: Validate datasets and emit fingerprint
         id: validate
@@ -161,8 +160,7 @@ jobs:
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip
-          pip install mlflow kfp scikit-learn numpy pandas
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          pip install mlflow kfp scikit-learn 'numpy<2' 'pandas<3'
 
       - name: Train deterministically and log to MLflow
         id: train
