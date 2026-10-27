@@ -20,6 +20,16 @@ class MlWorkflowDependencyTests(unittest.TestCase):
         )
         self.assertNotIn("pip install -r requirements.txt", training)
 
+    def test_jobs_without_checkout_do_not_enable_pip_cache(self):
+        workflow = WORKFLOW.read_text(encoding="utf-8")
+        drift_detection = workflow.split("  drift_detection:", 1)[1].split(
+            "  promote_model:", 1
+        )[0]
+        promote_model = workflow.split("  promote_model:", 1)[1]
+
+        self.assertNotIn("cache: pip", drift_detection)
+        self.assertNotIn("cache: pip", promote_model)
+
 
 if __name__ == "__main__":
     unittest.main()
